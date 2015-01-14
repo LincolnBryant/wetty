@@ -26,7 +26,7 @@
 
 'use strict';
 
-lib.rtdep('lib.fs', 'lib.Storage');
+lib.rtdep('lib.Storage');
 
 /**
  * @fileoverview Declares the hterm.* namespace and some basic shared utilities
@@ -60,6 +60,14 @@ hterm.zoomWarningMessage = 'ZOOM != 100%';
  */
 hterm.notifyCopyMessage = '\u2702';
 
+
+/**
+ * Text shown in a desktop notification for the terminal
+ * bell.  \u226a is a unicode EIGHTH NOTE, %(title) will
+ * be replaced by the terminal title.
+ */
+hterm.desktopNotificationTitle = '\u266A %(title) \u266A';
+
 /**
  * List of known hterm test suites.
  *
@@ -84,7 +92,7 @@ lib.registerInit('hterm', function(onInit) {
   }
 
   function onTab(tab) {
-    if (tab) {
+    if (tab && window.chrome) {
       chrome.windows.get(tab.windowId, null, onWindow);
     } else {
       // TODO(rginda): This is where we end up for a v1 app's background page.
@@ -96,8 +104,9 @@ lib.registerInit('hterm', function(onInit) {
 
   if (!hterm.defaultStorage) {
     var ary = navigator.userAgent.match(/\sChrome\/(\d\d)/);
-    var version = parseInt(ary[1]);
-    if (chrome.storage && chrome.storage.sync && version > 21) {
+    var version = ary ? parseInt(ary[1]) : -1;
+    if (window.chrome && chrome.storage && chrome.storage.sync &&
+        version > 21) {
       hterm.defaultStorage = new lib.Storage.Chrome(chrome.storage.sync);
     } else {
       hterm.defaultStorage = new lib.Storage.Local();
@@ -107,7 +116,7 @@ lib.registerInit('hterm', function(onInit) {
   // The chrome.tabs API is not supported in packaged apps, and detecting if
   // you're a packaged app is a little awkward.
   var isPackagedApp = false;
-  if (chrome && chrome.runtime && chrome.runtime.getManifest) {
+  if (window.chrome && chrome.runtime && chrome.runtime.getManifest) {
     var manifest = chrome.runtime.getManifest();
     var isPackagedApp = manifest.app && manifest.app.background;
   }
@@ -116,7 +125,7 @@ lib.registerInit('hterm', function(onInit) {
     // Packaged apps are never displayed in browser tabs.
     setTimeout(onWindow.bind(null, {type: 'popup'}), 0);
   } else {
-    if (chrome && chrome.tabs) {
+    if (window.chrome && chrome.tabs) {
       // The getCurrent method gets the tab that is "currently running", not the
       // topmost or focused tab.
       chrome.tabs.getCurrent(onTab);
@@ -153,7 +162,12 @@ hterm.getClientHeight = function(dom) {
  * @param {HTMLDocument} The document with the selection to copy.
  */
 hterm.copySelectionToClipboard = function(document) {
-  document.execCommand('copy');
+  try {
+    document.execCommand('copy');
+  } catch (firefoxException) {
+    // Ignore this. FF throws an exception if there was an error, even though
+    // the spec says just return false.
+  }
 };
 
 /**
@@ -162,7 +176,12 @@ hterm.copySelectionToClipboard = function(document) {
  * @param {HTMLDocument} The document to paste into.
  */
 hterm.pasteFromClipboard = function(document) {
-  document.execCommand('paste');
+  try {
+    document.execCommand('paste');
+  } catch (firefoxException) {
+    // Ignore this. FF throws an exception if there was an error, even though
+    // the spec says just return false.
+  }
 };
 
 /**
@@ -585,8 +604,14 @@ hterm.Keyboard = function(terminal) {
   this.ctrlPlusMinusZeroZoom = true;
 
   /**
-   * If true, don't send Ctrl-V to the host, but instead paste the contents of
-   * the clipboard. In that case, send a ^V to the host on Ctrl-Shift-V.
+   * Ctrl+C copies if true, sends ^C to host if false.
+   * Ctrl+Shift+C sends ^C to host if true, copies if false.
+   */
+  this.ctrlCCopy = false;
+
+  /**
+   * Ctrl+V pastes if true, sends ^V to host if false.
+   * Ctrl+Shift+V sends ^V to host if true, pastes if false.
    */
   this.ctrlVPaste = false;
 
@@ -619,6 +644,11 @@ hterm.Keyboard = function(terminal) {
    * Set whether the meta key sends a leading escape or not.
    */
   this.metaSendsEscape = true;
+
+  /**
+   * Set whether meta-V gets passed to host.
+   */
+  this.passMetaV = true;
 
   /**
    * Controls how the alt key is handled.
@@ -789,6 +819,14 @@ hterm.Keyboard.prototype.onTextInput_ = function(e) {
 hterm.Keyboard.prototype.onKeyPress_ = function(e) {
   var code;
 
+  var key = String.fromCharCode(e.which);
+  var lowerKey = key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && (lowerKey == 'c' || lowerKey == 'v')) {
+    // On FF the key press (not key down) event gets fired for copy/paste.
+    // Let it fall through for the default browser behaviour.
+    return;
+  }
+
   if (e.altKey && this.altSendsWhat == 'browser-key' && e.charCode == 0) {
     // If we got here because we were expecting the browser to handle an
     // alt sequence but it didn't do it, then we might be on an OS without
@@ -813,6 +851,20 @@ hterm.Keyboard.prototype.onKeyPress_ = function(e) {
   e.stopPropagation();
 };
 
+/**
+ * Prevent default handling for non-shifted event.
+ *
+ * When combined with Chrome permission 'app.window.fullscreen.overrideEsc',
+ * and called for both key down and key up events,
+ * the ESC key remains usable within fullscreen Chrome app windows.
+ */
+hterm.Keyboard.prototype.preventChromeAppNonShiftDefault_ = function(e) {
+  if (!window.chrome || !window.chrome.app || !window.chrome.app.window)
+    return;
+  if (!e.shiftKey)
+    e.preventDefault();
+};
+
 hterm.Keyboard.prototype.onBlur_ = function(e) {
   this.altIsPressed = false;
 };
@@ -820,6 +872,8 @@ hterm.Keyboard.prototype.onBlur_ = function(e) {
 hterm.Keyboard.prototype.onKeyUp_ = function(e) {
   if (e.keyCode == 18)
     this.altIsPressed = false;
+  if (e.keyCode == 27)
+    this.preventChromeAppNonShiftDefault_(e);
 };
 
 /**
@@ -828,6 +882,8 @@ hterm.Keyboard.prototype.onKeyUp_ = function(e) {
 hterm.Keyboard.prototype.onKeyDown_ = function(e) {
   if (e.keyCode == 18)
     this.altIsPressed = true;
+  if (e.keyCode == 27)
+    this.preventChromeAppNonShiftDefault_(e);
 
   var keyDef = this.keyMap.keyDefs[e.keyCode];
   if (!keyDef) {
@@ -1113,7 +1169,7 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
 
   var self = this;
 
-  // This function us used by the "macro" functions below.  It makes it
+  // This function is used by the "macro" functions below.  It makes it
   // possible to use the call() macro as an argument to any other macro.
   function resolve(action, e, k) {
     if (typeof action == 'function')
@@ -1164,9 +1220,17 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     }
   }
 
+  // If not e.altKey a, else b.
+  function alt(a, b) {
+    return function(e, k) {
+      var action = !e.altKey ? a : b
+      return resolve(action, e, k);
+    }
+  }
+
   // If no modifiers a, else b.
   function mod(a, b) {
-    return function (e, k) {
+    return function(e, k) {
       var action = !(e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) ? a : b;
       return resolve(action, e, k);
     }
@@ -1178,11 +1242,15 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
   // Call a method on the keymap instance.
   function c(m) { return function (e, k) { return this[m](e, k) } }
 
-  // Ignore if not trapping media keys
+  // Ignore if not trapping media keys.
   function med(fn) {
     return function(e, k) {
       if (!self.keyboard.mediaKeysAreFKeys) {
-        return hterm.Keyboard.KeyActions.PASS;
+        // Block Back, Forward, and Reload keys to avoid navigating away from
+        // the current page.
+        return (e.keyCode == 166 || e.keyCode == 167 || e.keyCode == 168) ?
+            hterm.Keyboard.KeyActions.CANCEL :
+            hterm.Keyboard.KeyActions.PASS;
       }
       return resolve(fn, e, k);
     };
@@ -1230,9 +1298,15 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [55,  '7&', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
     [56,  '8*', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
     [57,  '9(', DEFAULT, c('onCtrlNum_'),    c('onAltNum_'), c('onMetaNum_')],
-    [48,  '0)', DEFAULT, c('onPlusMinusZero_'),c('onAltNum_'),c('onMetaNum_')],
-    [189, '-_', DEFAULT, c('onPlusMinusZero_'),         DEFAULT,     DEFAULT],
-    [187, '=+', DEFAULT, c('onPlusMinusZero_'),         DEFAULT,     DEFAULT],
+    [48,  '0)', DEFAULT, c('onPlusMinusZero_'),c('onAltNum_'),c('onPlusMinusZero_')],
+    [189, '-_', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    [187, '=+', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    // Firefox -_ and =+
+    [173, '-_', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    [61, '=+', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+    // Firefox Italian +*
+    [171, '+*', DEFAULT, c('onPlusMinusZero_'), DEFAULT, c('onPlusMinusZero_')],
+
     [8,   '[BKSP]', bs('\x7f', '\b'), bs('\b', '\x7f'), DEFAULT,     DEFAULT],
 
     // Third row.
@@ -1275,12 +1349,12 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [90,  'zZ',   DEFAULT, ctl('Z'),               DEFAULT, DEFAULT],
     [88,  'xX',   DEFAULT, ctl('X'),               DEFAULT, DEFAULT],
     [67,  'cC',   DEFAULT, c('onCtrlC_'),          DEFAULT, c('onMetaC_')],
-    [86,  'vV',   DEFAULT, c('onCtrlV_'),          DEFAULT, PASS],
+    [86,  'vV',   DEFAULT, c('onCtrlV_'),          DEFAULT, c('onMetaV_')],
     [66,  'bB',   DEFAULT, sh(ctl('B'), PASS),     DEFAULT, sh(DEFAULT, PASS)],
     [78,  'nN',   DEFAULT, c('onCtrlN_'),          DEFAULT, c('onMetaN_')],
     [77,  'mM',   DEFAULT, ctl('M'),               DEFAULT, DEFAULT],
-    [188, ',<',   DEFAULT, STRIP,                  DEFAULT, DEFAULT],
-    [190, '.>',   DEFAULT, STRIP,                  DEFAULT, DEFAULT],
+    [188, ',<',   DEFAULT, alt(STRIP, PASS),       DEFAULT, DEFAULT],
+    [190, '.>',   DEFAULT, alt(STRIP, PASS),       DEFAULT, DEFAULT],
     [191, '/?',   DEFAULT, sh(ctl('_'), ctl('?')), DEFAULT, DEFAULT],
 
     // Sixth and final row.
@@ -1339,10 +1413,11 @@ hterm.Keyboard.KeyMap.prototype.reset = function() {
     [183, '[FSCR]',   med(mod(SS3+'S', CSI+'S')), DEFAULT, CSI+"26~", DEFAULT],
     [182, '[WINS]',   med(CSI + '15~'),           DEFAULT, CSI+"28~", DEFAULT],
     [216, '[BRIT-]',  med(CSI + '17~'),           DEFAULT, CSI+"29~", DEFAULT],
-    [217, '[BRIT+]',  med(CSI + '18~'),           DEFAULT, CSI+"31~", DEFAULT],
-    [173, '[MUTE]',   med(CSI + '19~'),           DEFAULT, CSI+"32~", DEFAULT],
-    [174, '[VOL-]',   med(CSI + '20~'),           DEFAULT, CSI+"33~", DEFAULT],
-    [175, '[VOL+]',   med(CSI + '21~'),           DEFAULT, CSI+"34~", DEFAULT]
+    [217, '[BRIT+]',  med(CSI + '18~'),           DEFAULT, CSI+"31~", DEFAULT]
+
+    // 173 [MUTE], 174 [VOL-] and 175 [VOL+] are trapped by the Chrome OS
+    // window manager, so we'll never see them. Note that 173 is also
+    // Firefox's -_ keycode.
   );
 };
 
@@ -1362,7 +1437,7 @@ hterm.Keyboard.KeyMap.prototype.onKeyInsert_ = function(e) {
 hterm.Keyboard.KeyMap.prototype.onKeyHome_ = function(e) {
   if (!this.keyboard.homeKeysScroll ^ e.shiftKey) {
     if ((e.altey || e.ctrlKey || e.shiftKey) ||
-        !this.keyboard.applicationKeypad) {
+        !this.keyboard.applicationCursor) {
       return '\x1b[H';
     }
 
@@ -1379,7 +1454,7 @@ hterm.Keyboard.KeyMap.prototype.onKeyHome_ = function(e) {
 hterm.Keyboard.KeyMap.prototype.onKeyEnd_ = function(e) {
   if (!this.keyboard.homeKeysScroll ^ e.shiftKey) {
     if ((e.altKey || e.ctrlKey || e.shiftKey) ||
-        !this.keyboard.applicationKeypad) {
+        !this.keyboard.applicationCursor) {
       return '\x1b[F';
     }
 
@@ -1483,27 +1558,36 @@ hterm.Keyboard.KeyMap.prototype.onMetaNum_ = function(e, keyDef) {
 };
 
 /**
- * Either send a ^C or allow the browser to interpret the keystroke as a copy
- * command.
- *
- * If there is no selection, or if the user presses Ctrl-Shift-C, then we'll
- * transmit a ^C ('\x03').  If there is a selection, we defer to the
- * browser.  In this case we clear out the selection so the user knows we
- * heard them, and also to give them a chance to send a ^C by just hitting
- * the key again.
+ * Either send a ^C or interpret the keystroke as a copy command.
  */
 hterm.Keyboard.KeyMap.prototype.onCtrlC_ = function(e, keyDef) {
   var selection = this.keyboard.terminal.getDocument().getSelection();
-  if (e.shiftKey || selection.isCollapsed) {
-    // If the shift key is being held or there is no document selection, then
-    // send a ^C.
-    return '\x03';
+
+  if (!selection.isCollapsed) {
+    if (this.keyboard.ctrlCCopy && !e.shiftKey) {
+      // Ctrl-C should copy if there is a selection, send ^C otherwise.
+      // Perform the copy by letting the browser handle Ctrl-C.  On most
+      // browsers, this is the *only* way to place text on the clipboard from
+      // the 'drive-by' web.
+      if (this.keyboard.terminal.clearSelectionAfterCopy) {
+        setTimeout(selection.collapseToEnd.bind(selection), 50);
+      }
+      return hterm.Keyboard.KeyActions.PASS;
+    }
+
+    if (!this.keyboard.ctrlCCopy && e.shiftKey) {
+      // Ctrl-Shift-C should copy if there is a selection, send ^C otherwise.
+      // Perform the copy manually.  This only works in situations where
+      // document.execCommand('copy') is allowed.
+      if (this.keyboard.terminal.clearSelectionAfterCopy) {
+        setTimeout(selection.collapseToEnd.bind(selection), 50);
+      }
+      this.keyboard.terminal.copySelectionToClipboard();
+      return hterm.Keyboard.KeyActions.CANCEL;
+    }
   }
 
-  // Otherwise let the browser handle it as a copy command.  Clear the selection
-  // soon after a Ctrl-C copy, so that it frees up Ctrl-C to send ^C.
-  setTimeout(selection.collapseToEnd.bind(selection), 750);
-  return hterm.Keyboard.KeyActions.PASS;
+  return '\x03';
 };
 
 /**
@@ -1534,6 +1618,7 @@ hterm.Keyboard.KeyMap.prototype.onCtrlV_ = function(e, keyDef) {
       (e.shiftKey && !this.keyboard.ctrlVPaste)) {
     return hterm.Keyboard.KeyActions.PASS;
   }
+
   return '\x16';
 };
 
@@ -1573,8 +1658,25 @@ hterm.Keyboard.KeyMap.prototype.onMetaC_ = function(e, keyDef) {
   }
 
   // Otherwise let the browser handle it as a copy command.
-  setTimeout(function() { document.getSelection().collapseToEnd() }, 50);
+  if (this.keyboard.terminal.clearSelectionAfterCopy) {
+    setTimeout(function() { document.getSelection().collapseToEnd() }, 50);
+  }
   return hterm.Keyboard.KeyActions.PASS;
+};
+
+/**
+ * Either PASS or DEFAULT Meta-V, depending on preference.
+ *
+ * Always PASS Meta-Shift-V to allow browser to interpret the keystroke as
+ * a paste command.
+ */
+hterm.Keyboard.KeyMap.prototype.onMetaV_ = function(e, keyDef) {
+  if (e.shiftKey)
+    return hterm.Keyboard.KeyActions.PASS;
+
+  return this.keyboard.passMetaV ?
+      hterm.Keyboard.KeyActions.PASS :
+      hterm.Keyboard.KeyActions.DEFAULT;
 };
 
 /**
@@ -1662,6 +1764,7 @@ hterm.Options = function(opt_copy) {
   this.cursorBlink = opt_copy ? opt_copy.cursorBlink : false;
   this.insertMode = opt_copy ? opt_copy.insertMode : false;
   this.reverseVideo = opt_copy ? opt_copy.reverseVideo : false;
+  this.bracketedPaste = opt_copy ? opt_copy.bracketedPaste : false;
 };
 // SOURCE FILE: hterm/js/hterm_preference_manager.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -1680,301 +1783,359 @@ lib.rtdep('lib.f', 'lib.Storage');
 hterm.PreferenceManager = function(profileId) {
   lib.PreferenceManager.call(this, hterm.defaultStorage,
                              '/hterm/profiles/' + profileId);
-  this.definePreferences
-  ([
-    /**
-     * If set, undoes the Chrome OS Alt-Backspace->DEL remap, so that
-     * alt-backspace indeed is alt-backspace.
-     */
-    ['alt-backspace-is-meta-backspace', false],
+  var defs = hterm.PreferenceManager.defaultPreferences;
+  Object.keys(defs).forEach(function(key) {
+    this.definePreference(key, defs[key]);
+  }.bind(this));
+};
 
-    /**
-     * Set whether the alt key acts as a meta key or as a distinct alt key.
-     */
-    ['alt-is-meta', false],
+hterm.PreferenceManager.defaultPreferences = {
+  /**
+   * If set, undoes the Chrome OS Alt-Backspace->DEL remap, so that
+   * alt-backspace indeed is alt-backspace.
+   */
+  'alt-backspace-is-meta-backspace': false,
 
-    /**
-     * Controls how the alt key is handled.
-     *
-     *  escape....... Send an ESC prefix.
-     *  8-bit........ Add 128 to the unshifted character as in xterm.
-     *  browser-key.. Wait for the keypress event and see what the browser says.
-     *                (This won't work well on platforms where the browser
-     *                 performs a default action for some alt sequences.)
-     */
-    ['alt-sends-what', 'escape'],
+  /**
+   * Set whether the alt key acts as a meta key or as a distinct alt key.
+   */
+  'alt-is-meta': false,
 
-    /**
-     * Terminal bell sound.  Empty string for no audible bell.
-     */
-    ['audible-bell-sound', 'lib-resource:hterm/audio/bell'],
+  /**
+   * Controls how the alt key is handled.
+   *
+   *  escape....... Send an ESC prefix.
+   *  8-bit........ Add 128 to the unshifted character as in xterm.
+   *  browser-key.. Wait for the keypress event and see what the browser says.
+   *                (This won't work well on platforms where the browser
+   *                 performs a default action for some alt sequences.)
+   */
+  'alt-sends-what': 'escape',
 
-    /**
-     * The background color for text with no other color attributes.
-     */
-    ['background-color', 'rgb(16, 16, 16)'],
+  /**
+   * Terminal bell sound.  Empty string for no audible bell.
+   */
+  'audible-bell-sound': 'lib-resource:hterm/audio/bell',
 
-    /**
-     * The background image.
-     */
-    ['background-image', ''],
+  /**
+   * If true, terminal bells in the background will create a Web
+   * Notification. http://www.w3.org/TR/notifications/
+   *
+   * Displaying notifications requires permission from the user. When this
+   * option is set to true, hterm will attempt to ask the user for permission
+   * if necessary. Note browsers may not show this permission request if it
+   * did not originate from a user action.
+   *
+   * Chrome extensions with the "notfications" permission have permission to
+   * display notifications.
+   */
+  'desktop-notification-bell': false,
 
-    /**
-     * The background image size,
-     *
-     * Defaults to none.
-     */
-    ['background-size', ''],
+  /**
+   * The background color for text with no other color attributes.
+   */
+  'background-color': 'rgb(16, 16, 16)',
 
-    /**
-     * The background image position,
-     *
-     * Defaults to none.
-     */
-    ['background-position', ''],
+  /**
+   * The background image.
+   */
+  'background-image': '',
 
-    /**
-     * If true, the backspace should send BS ('\x08', aka ^H).  Otherwise
-     * the backspace key should send '\x7f'.
-     */
-    ['backspace-sends-backspace', false],
+  /**
+   * The background image size,
+   *
+   * Defaults to none.
+   */
+  'background-size': '',
 
-    /**
-     * Whether or not to close the window when the command exits.
-     */
-    ['close-on-exit', true],
+  /**
+   * The background image position,
+   *
+   * Defaults to none.
+   */
+  'background-position': '',
 
-    /**
-     * Whether or not to blink the cursor by default.
-     */
-    ['cursor-blink', false],
+  /**
+   * If true, the backspace should send BS ('\x08', aka ^H).  Otherwise
+   * the backspace key should send '\x7f'.
+   */
+  'backspace-sends-backspace': false,
 
-    /**
-     * The color of the visible cursor.
-     */
-    ['cursor-color', 'rgba(255,0,0,0.5)'],
+  /**
+   * Whether or not to close the window when the command exits.
+   */
+  'close-on-exit': true,
 
-    /**
-     * Override colors in the default palette.
-     *
-     * This can be specified as an array or an object.  If specified as an
-     * object it is assumed to be a sparse array, where each property
-     * is a numeric index into the color palette.
-     *
-     * Values can be specified as css almost any css color value.  This
-     * includes #RGB, #RRGGBB, rgb(...), rgba(...), and any color names
-     * that are also part of the stock X11 rgb.txt file.
-     *
-     * You can use 'null' to specify that the default value should be not
-     * be changed.  This is useful for skipping a small number of indicies
-     * when the value is specified as an array.
-     */
-    ['color-palette-overrides', null],
+  /**
+   * Whether or not to blink the cursor by default.
+   */
+  'cursor-blink': false,
 
-    /**
-     * Automatically copy mouse selection to the clipboard.
-     */
-    ['copy-on-select', true],
+  /**
+   * The cursor blink rate in milliseconds.
+   *
+   * A two element array, the first of which is how long the cursor should be
+   * on, second is how long it should be off.
+   */
+  'cursor-blink-cycle': [1000, 500],
 
-    /**
-     * If true, Ctrl-Plus/Minus/Zero controls zoom.
-     * If false, Ctrl-Shift-Plus/Minus/Zero controls zoom, Ctrl-Minus sends ^_,
-     * Ctrl-Plus/Zero do nothing.
-     */
-    ['ctrl-plus-minus-zero-zoom', true],
+  /**
+   * The color of the visible cursor.
+   */
+  'cursor-color': 'rgba(255, 0, 0, 0.5)',
 
-    /**
-     * Ctrl+V pastes if true, sent to host if false.
-     * Ctrl+Shift+V sends a ^V to host if true, pastes if false.
-     */
-    ['ctrl-v-paste', false],
+  /**
+   * Override colors in the default palette.
+   *
+   * This can be specified as an array or an object.  If specified as an
+   * object it is assumed to be a sparse array, where each property
+   * is a numeric index into the color palette.
+   *
+   * Values can be specified as css almost any css color value.  This
+   * includes #RGB, #RRGGBB, rgb(...), rgba(...), and any color names
+   * that are also part of the stock X11 rgb.txt file.
+   *
+   * You can use 'null' to specify that the default value should be not
+   * be changed.  This is useful for skipping a small number of indicies
+   * when the value is specified as an array.
+   */
+  'color-palette-overrides': null,
 
-    /**
-     * True to enable 8-bit control characters, false to ignore them.
-     *
-     * We'll respect the two-byte versions of these control characters
-     * regardless of this setting.
-     */
-    ['enable-8-bit-control', false],
+  /**
+   * Automatically copy mouse selection to the clipboard.
+   */
+  'copy-on-select': true,
 
-    /**
-     * True if we should use bold weight font for text with the bold/bright
-     * attribute.  False to use the normal weight font.  Null to autodetect.
-     */
-    ['enable-bold', null],
+  /**
+   * Whether to use the default window copy behaviour.
+   */
+  'use-default-window-copy': false,
 
-    /**
-     * True if we should use bright colors (8-15 on a 16 color palette)
-     * for any text with the bold attribute.  False otherwise.
-     */
-    ['enable-bold-as-bright', true],
+  /**
+   * Whether to clear the selection after copying.
+   */
+  'clear-selection-after-copy': true,
 
-    /**
-     * Allow the host to write directly to the system clipboard.
-     */
-    ['enable-clipboard-notice', true],
+  /**
+   * If true, Ctrl-Plus/Minus/Zero controls zoom.
+   * If false, Ctrl-Shift-Plus/Minus/Zero controls zoom, Ctrl-Minus sends ^_,
+   * Ctrl-Plus/Zero do nothing.
+   */
+  'ctrl-plus-minus-zero-zoom': true,
 
-    /**
-     * Allow the host to write directly to the system clipboard.
-     */
-    ['enable-clipboard-write', true],
+  /**
+   * Ctrl+C copies if true, send ^C to host if false.
+   * Ctrl+Shift+C sends ^C to host if true, copies if false.
+   */
+  'ctrl-c-copy': false,
 
-    /**
-     * Respect the host's attempt to change the cursor blink status using
-     * DEC Private Mode 12.
-     */
-    ['enable-dec12', false],
+  /**
+   * Ctrl+V pastes if true, send ^V to host if false.
+   * Ctrl+Shift+V sends ^V to host if true, pastes if false.
+   */
+  'ctrl-v-paste': false,
 
-    /**
-     * The default environment variables.
-     */
-    ['environment', {TERM: 'xterm-256color'}],
+  /**
+   * Set whether East Asian Ambiguous characters have two column width.
+   */
+  'east-asian-ambiguous-as-two-column': false,
 
-    /**
-     * Default font family for the terminal text.
-     */
-    ['font-family', ('"DejaVu Sans Mono", "Everson Mono", ' +
-                     'FreeMono, "Menlo", "Terminal", ' +
-                     'monospace')],
+  /**
+   * True to enable 8-bit control characters, false to ignore them.
+   *
+   * We'll respect the two-byte versions of these control characters
+   * regardless of this setting.
+   */
+  'enable-8-bit-control': false,
 
-    /**
-     * The default font size in pixels.
-     */
-    ['font-size', 15],
+  /**
+   * True if we should use bold weight font for text with the bold/bright
+   * attribute.  False to use the normal weight font.  Null to autodetect.
+   */
+  'enable-bold': null,
 
-    /**
-     * Anti-aliasing.
-     */
-    ['font-smoothing', 'antialiased'],
+  /**
+   * True if we should use bright colors (8-15 on a 16 color palette)
+   * for any text with the bold attribute.  False otherwise.
+   */
+  'enable-bold-as-bright': true,
 
-    /**
-     * The foreground color for text with no other color attributes.
-     */
-    ['foreground-color', 'rgb(240, 240, 240)'],
+  /**
+   * Allow the host to write directly to the system clipboard.
+   */
+  'enable-clipboard-notice': true,
 
-    /**
-     * If true, home/end will control the terminal scrollbar and shift home/end
-     * will send the VT keycodes.  If false then home/end sends VT codes and
-     * shift home/end scrolls.
-     */
-    ['home-keys-scroll', false],
+  /**
+   * Allow the host to write directly to the system clipboard.
+   */
+  'enable-clipboard-write': true,
 
-    /**
-     * Max length of a DCS, OSC, PM, or APS sequence before we give up and
-     * ignore the code.
-     */
-    ['max-string-sequence', 100000],
+  /**
+   * Respect the host's attempt to change the cursor blink status using
+   * DEC Private Mode 12.
+   */
+  'enable-dec12': false,
 
-    /**
-     * If true, convert media keys to their Fkey equivalent. If false, let
-     * Chrome handle the keys.
-     */
-    ['media-keys-are-fkeys', false],
+  /**
+   * The default environment variables.
+   */
+  'environment': {'TERM': 'xterm-256color'},
 
-    /**
-     * Set whether the meta key sends a leading escape or not.
-     */
-    ['meta-sends-escape', true],
+  /**
+   * Default font family for the terminal text.
+   */
+  'font-family': ('"DejaVu Sans Mono", "Everson Mono", ' +
+                  'FreeMono, "Menlo", "Terminal", ' +
+                  'monospace'),
 
-    /**
-     * Mouse paste button, or null to autodetect.
-     *
-     * For autodetect, we'll try to enable middle button paste for non-X11
-     * platforms.
-     *
-     * On X11 we move it to button 3, but that'll probably be a context menu
-     * in the future.
-     */
-    ['mouse-paste-button', null],
+  /**
+   * The default font size in pixels.
+   */
+  'font-size': 15,
 
-    /**
-     * If true, page up/down will control the terminal scrollbar and shift
-     * page up/down will send the VT keycodes.  If false then page up/down
-     * sends VT codes and shift page up/down scrolls.
-     */
-    ['page-keys-scroll', false],
+  /**
+   * Anti-aliasing.
+   */
+  'font-smoothing': 'antialiased',
 
-    /**
-     * Set whether we should pass Alt-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Alt-1..9 will be handled by the browser.  If false, Alt-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-alt-number', null],
+  /**
+   * The foreground color for text with no other color attributes.
+   */
+  'foreground-color': 'rgb(240, 240, 240)',
 
-    /**
-     * Set whether we should pass Ctrl-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Ctrl-1..9 will be handled by the browser.  If false, Ctrl-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-ctrl-number', null],
+  /**
+   * If true, home/end will control the terminal scrollbar and shift home/end
+   * will send the VT keycodes.  If false then home/end sends VT codes and
+   * shift home/end scrolls.
+   */
+  'home-keys-scroll': false,
 
-    /**
-     * Set whether we should pass Meta-1..9 to the browser.
-     *
-     * This is handy when running hterm in a browser tab, so that you don't lose
-     * Chrome's "switch to tab" keyboard accelerators.  When not running in a
-     * tab it's better to send these keys to the host so they can be used in
-     * vim or emacs.
-     *
-     * If true, Meta-1..9 will be handled by the browser.  If false, Meta-1..9
-     * will be sent to the host.  If null, autodetect based on browser platform
-     * and window type.
-     */
-    ['pass-meta-number', null],
+  /**
+   * Max length of a DCS, OSC, PM, or APS sequence before we give up and
+   * ignore the code.
+   */
+  'max-string-sequence': 100000,
 
-    /**
-     * Set the expected encoding for data received from the host.
-     *
-     * Valid values are 'utf-8' and 'raw'.
-     */
-    ['receive-encoding', 'utf-8'],
+  /**
+   * If true, convert media keys to their Fkey equivalent. If false, let
+   * Chrome handle the keys.
+   */
+  'media-keys-are-fkeys': false,
 
-    /**
-     * If true, scroll to the bottom on any keystroke.
-     */
-    ['scroll-on-keystroke', true],
+  /**
+   * Set whether the meta key sends a leading escape or not.
+   */
+  'meta-sends-escape': true,
 
-    /**
-     * If true, scroll to the bottom on terminal output.
-     */
-    ['scroll-on-output', false],
+  /**
+   * Mouse paste button, or null to autodetect.
+   *
+   * For autodetect, we'll try to enable middle button paste for non-X11
+   * platforms.
+   *
+   * On X11 we move it to button 3, but that'll probably be a context menu
+   * in the future.
+   */
+  'mouse-paste-button': null,
 
-    /**
-     * The vertical scrollbar mode.
-     */
-    ['scrollbar-visible', true],
+  /**
+   * If true, page up/down will control the terminal scrollbar and shift
+   * page up/down will send the VT keycodes.  If false then page up/down
+   * sends VT codes and shift page up/down scrolls.
+   */
+  'page-keys-scroll': false,
 
-    /**
-     * Set the encoding for data sent to host.
-     *
-     * Valid values are 'utf-8' and 'raw'.
-     */
-    ['send-encoding', 'utf-8'],
+  /**
+   * Set whether we should pass Alt-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Alt-1..9 will be handled by the browser.  If false, Alt-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-alt-number': null,
 
-    /**
-     * Shift + Insert pastes if true, sent to host if false.
-     */
-    ['shift-insert-paste', true],
+  /**
+   * Set whether we should pass Ctrl-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Ctrl-1..9 will be handled by the browser.  If false, Ctrl-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-ctrl-number': null,
 
-    /**
-     * User stylesheet to include in the terminal document.
-     */
-    ['user-css', ''],
-   ]);
+  /**
+   * Set whether we should pass Meta-1..9 to the browser.
+   *
+   * This is handy when running hterm in a browser tab, so that you don't lose
+   * Chrome's "switch to tab" keyboard accelerators.  When not running in a
+   * tab it's better to send these keys to the host so they can be used in
+   * vim or emacs.
+   *
+   * If true, Meta-1..9 will be handled by the browser.  If false, Meta-1..9
+   * will be sent to the host.  If null, autodetect based on browser platform
+   * and window type.
+   */
+  'pass-meta-number': null,
+
+  /**
+   * Set whether meta-V gets passed to host.
+   */
+  'pass-meta-v': true,
+
+  /**
+   * Set the expected encoding for data received from the host.
+   *
+   * Valid values are 'utf-8' and 'raw'.
+   */
+  'receive-encoding': 'utf-8',
+
+  /**
+   * If true, scroll to the bottom on any keystroke.
+   */
+  'scroll-on-keystroke': true,
+
+  /**
+   * If true, scroll to the bottom on terminal output.
+   */
+  'scroll-on-output': false,
+
+  /**
+   * The vertical scrollbar mode.
+   */
+  'scrollbar-visible': true,
+
+  /**
+   * The multiplier for the pixel delta in mousewheel event caused by the scroll
+   * wheel. Alters how fast the page scrolls.
+   */
+  'scroll-wheel-move-multiplier': 1,
+
+  /**
+   * Set the encoding for data sent to host.
+   *
+   * Valid values are 'utf-8' and 'raw'.
+   */
+  'send-encoding': 'utf-8',
+
+  /**
+   * Shift + Insert pastes if true, sent to host if false.
+   */
+  'shift-insert-paste': true,
+
+  /**
+   * User stylesheet to include in the terminal document.
+   */
+  'user-css': ''
 };
 
 hterm.PreferenceManager.prototype = {
@@ -2341,9 +2502,18 @@ hterm.Screen.prototype.clearCursorRow = function() {
     text = lib.f.getWhitespace(this.columnCount_);
   }
 
+  // We shouldn't honour inverse colors when clearing an area, to match
+  // xterm's back color erase behaviour.
+  var inverse = this.textAttributes.inverse;
+  this.textAttributes.inverse = false;
+  this.textAttributes.syncColors();
+
   var node = this.textAttributes.createContainer(text);
   this.cursorRowNode_.appendChild(node);
   this.cursorNode_ = node;
+
+  this.textAttributes.inverse = inverse;
+  this.textAttributes.syncColors();
 };
 
 /**
@@ -2432,7 +2602,12 @@ hterm.Screen.prototype.setCursorPosition = function(row, column) {
  * cursor position.
  */
 hterm.Screen.prototype.syncSelectionCaret = function(selection) {
-  selection.collapse(this.cursorNode_, this.cursorOffset_);
+  try {
+    selection.collapse(this.cursorNode_, this.cursorOffset_);
+  } catch (firefoxIgnoredException) {
+    // FF can throw an exception if the range is off, rather than just not
+    // performing the collapse.
+  }
 };
 
 /**
@@ -2553,13 +2728,16 @@ hterm.Screen.prototype.insertString = function(str) {
     // This whitespace should be completely unstyled.  Underline and background
     // color would be visible on whitespace, so we can't use one of those
     // spans to hold the text.
-    if (!(this.textAttributes.underline || this.textAttributes.background ||
-          this.textAttributes.wcNode)) {
+    if (!(this.textAttributes.underline ||
+          this.textAttributes.background ||
+          this.textAttributes.wcNode ||
+          this.textAttributes.tileData != null)) {
       // Best case scenario, we can just pretend the spaces were part of the
       // original string.
       str = ws + str;
     } else if (cursorNode.nodeType == 3 ||
                !(cursorNode.wcNode ||
+                 cursorNode.tileNode ||
                  cursorNode.style.textDecoration ||
                  cursorNode.style.backgroundColor)) {
       // Second best case, the current node is able to hold the whitespace.
@@ -2910,11 +3088,6 @@ hterm.Screen.prototype.setRange_ = function(row, start, end, range) {
 /**
  * Expands selection to surround URLs.
  *
- * Uses this regular expression to expand the selection:
- * [^\s\[\](){}<>"'\^!@#$%&*,.;:~`]
- * [^\s\[\](){}<>"'\^]*
- * [^\s\[\](){}<>"'\^!@#$%&*,.;:~`]
- *
  * @param {Selection} selection Selection to expand.
  **/
 hterm.Screen.prototype.expandSelection = function(selection) {
@@ -2940,13 +3113,15 @@ hterm.Screen.prototype.expandSelection = function(selection) {
   if (endPosition == -1)
     return;
 
-  var outsideMatch = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,.;:~`]';
+  // Matches can start with '~' or '.', since paths frequently do.
+  var leftMatch   = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,;:`]';
+  var rightMatch  = '[^\\s\\[\\](){}<>"\'\\^!@#$%&*,;:~.`]';
   var insideMatch = '[^\\s\\[\\](){}<>"\'\\^]*';
 
   //Move start to the left.
   var rowText = this.getLineText_(row);
   var lineUpToRange = lib.wc.substring(rowText, 0, endPosition);
-  var leftRegularExpression = new RegExp(outsideMatch + insideMatch + "$");
+  var leftRegularExpression = new RegExp(leftMatch + insideMatch + "$");
   var expandedStart = lineUpToRange.search(leftRegularExpression);
   if (expandedStart == -1 || expandedStart > startPosition)
     return;
@@ -2954,7 +3129,7 @@ hterm.Screen.prototype.expandSelection = function(selection) {
   //Move end to the right.
   var lineFromRange = lib.wc.substring(rowText, startPosition,
                                        lib.wc.strWidth(rowText));
-  var rightRegularExpression = new RegExp("^" + insideMatch + outsideMatch);
+  var rightRegularExpression = new RegExp("^" + insideMatch + rightMatch);
   var found = lineFromRange.match(rightRegularExpression);
   if (!found)
     return;
@@ -3032,6 +3207,10 @@ hterm.ScrollPort = function(rowProvider) {
   // syncScrollHeight().
   this.lastRowCount_ = 0;
 
+  // The scroll wheel pixel delta multiplier to increase/descrease
+  // the scroll speed of mouse wheel events. See: http://goo.gl/sXelnq
+  this.scrollWheelMultiplier_ = 1;
+
   /**
    * True if the last scroll caused the scrollport to show the final row.
    */
@@ -3043,7 +3222,12 @@ hterm.ScrollPort = function(rowProvider) {
   /**
    * A guess at the current scrollbar width, fixed in resize().
    */
-  this.currentScrollbarWidthPx = 16
+  this.currentScrollbarWidthPx = 16;
+
+  /**
+   * Whether the ctrl-v key on the screen should paste.
+   */
+  this.ctrlVPaste = false;
 
   this.div_ = null;
   this.document_ = null;
@@ -3222,6 +3406,7 @@ hterm.ScrollPort.Selection.prototype.sync = function() {
   this.isMultiline = anchorRow.rowIndex != focusRow.rowIndex;
 };
 
+
 /**
  * Turn a div into this hterm.ScrollPort.
  */
@@ -3235,6 +3420,11 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'position: absolute;' +
       'width: 100%');
 
+  // Set the iframe src to # in FF.  Otherwise when the frame's
+  // load event fires in FF it clears out the content of the iframe.
+  if ('mozInnerScreenX' in window)  // detect a FF only property
+    this.iframe_.src = '#';
+
   div.appendChild(this.iframe_);
 
   this.iframe_.contentWindow.addEventListener('resize',
@@ -3247,7 +3437,8 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'height: 100%;' +
       'width: 100%;' +
       'overflow: hidden;' +
-      '-webkit-user-select: none;');
+      '-webkit-user-select: none;' +
+      '-moz-user-select: none;');
 
   var style = doc.createElement('style');
   style.textContent = 'x-row {}';
@@ -3279,18 +3470,12 @@ hterm.ScrollPort.prototype.decorate = function(div) {
 
   this.screen_.addEventListener('scroll', this.onScroll_.bind(this));
   this.screen_.addEventListener('mousewheel', this.onScrollWheel_.bind(this));
+  this.screen_.addEventListener(
+      'DOMMouseScroll', this.onScrollWheel_.bind(this));
   this.screen_.addEventListener('copy', this.onCopy_.bind(this));
   this.screen_.addEventListener('paste', this.onPaste_.bind(this));
 
-  // We send focus to this element just before a paste happens, so we can
-  // capture the pasted text and forward it on to someone who cares.
-  this.pasteTarget_ = doc.createElement('textarea');
-  this.pasteTarget_.setAttribute('tabindex', '-1');
-  this.pasteTarget_.style.cssText = (
-    'position: absolute;' +
-    'top: -999px;');
-
-  doc.body.appendChild(this.pasteTarget_);
+  doc.body.addEventListener('keydown', this.onBodyKeyDown_.bind(this));
 
   // This is the main container for the fixed rows.
   this.rowNodes_ = doc.createElement('div');
@@ -3298,7 +3483,8 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'display: block;' +
       'position: fixed;' +
       'overflow: hidden;' +
-      '-webkit-user-select: text;');
+      '-webkit-user-select: text;' +
+      '-moz-user-select: text;');
   this.screen_.appendChild(this.rowNodes_);
 
   // Two nodes to hold offscreen text during the copy event.
@@ -3346,6 +3532,24 @@ hterm.ScrollPort.prototype.decorate = function(div) {
       'top: 0;' +
       'left: 0;' +
       'visibility: hidden');
+
+
+  // We send focus to this element just before a paste happens, so we can
+  // capture the pasted text and forward it on to someone who cares.
+  this.pasteTarget_ = doc.createElement('textarea');
+  this.pasteTarget_.setAttribute('tabindex', '-1');
+  this.pasteTarget_.style.cssText = (
+    'position: absolute;' +
+    'height: 1px;' +
+    'width: 1px;' +
+    'left: 0px; ' +
+    'bottom: 0px;' +
+    'opacity: 0');
+  this.pasteTarget_.contentEditable = true;
+
+  this.screen_.appendChild(this.pasteTarget_);
+  this.pasteTarget_.addEventListener(
+      'textInput', this.handlePasteTargetTextInput_.bind(this));
 
   this.resize();
 };
@@ -3421,6 +3625,10 @@ hterm.ScrollPort.prototype.setBackgroundSize = function(size) {
 
 hterm.ScrollPort.prototype.setBackgroundPosition = function(position) {
   this.screen_.style.backgroundPosition = position;
+};
+
+hterm.ScrollPort.prototype.setCtrlVPaste = function(ctrlVPaste) {
+  this.ctrlVPaste = ctrlVPaste;
 };
 
 /**
@@ -3560,11 +3768,15 @@ hterm.ScrollPort.prototype.measureCharacterSize = function(opt_weight) {
         'height: auto !important;' +
         'width: auto !important;');
 
-    this.ruler_.textContent = ('XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX' +
-                               'XXXXXXXXXXXXXXXXXXXX');
+    // We need to put the text in a span to make the size calculation
+    // work properly in Firefox
+    this.rulerSpan_ = this.document_.createElement('span');
+    this.rulerSpan_.textContent = ('XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX' +
+                                   'XXXXXXXXXXXXXXXXXXXX');
+    this.ruler_.appendChild(this.rulerSpan_);
 
     this.rulerBaseline_ = this.document_.createElement('span');
     // We want to collapse it on the baseline
@@ -3572,16 +3784,13 @@ hterm.ScrollPort.prototype.measureCharacterSize = function(opt_weight) {
     this.rulerBaseline_.textContent = 'X';
   }
 
-  this.ruler_.style.fontWeight = opt_weight || '';
+  this.rulerSpan_.style.fontWeight = opt_weight || '';
 
   this.rowNodes_.appendChild(this.ruler_);
-  var rulerSize = hterm.getClientSize(this.ruler_);
+  var rulerSize = hterm.getClientSize(this.rulerSpan_);
 
-  // In some fonts, underscores actually show up below the reported height.
-  // We add one to the height here to compensate, and have to add a bottom
-  // border to text with a background color over in text_attributes.js.
   var size = new hterm.Size(rulerSize.width / this.ruler_.textContent.length,
-                            rulerSize.height + 1);
+                            rulerSize.height);
 
   this.ruler_.appendChild(this.rulerBaseline_);
   size.baseline = this.rulerBaseline_.offsetTop;
@@ -4172,7 +4381,13 @@ hterm.ScrollPort.prototype.onScrollWheel_ = function(e) {
   if (e.defaultPrevented)
     return;
 
-  var top = this.screen_.scrollTop - e.wheelDeltaY;
+  // In FF, the event is DOMMouseScroll and puts the scroll pixel delta in the
+  // 'detail' field of the event.  It also flips the mapping of which direction
+  // a negative number means in the scroll.
+  var delta = e.type == 'DOMMouseScroll' ? (-1 * e.detail) : e.wheelDeltaY;
+  delta *= this.scrollWheelMultiplier_;
+
+  var top = this.screen_.scrollTop - delta;
   if (top < 0)
     top = 0;
 
@@ -4274,6 +4489,20 @@ hterm.ScrollPort.prototype.onCopy_ = function(e) {
 };
 
 /**
+ * Focuses on the paste target on a ctrl-v keydown event, as in
+ * FF a content editable element must be focused before the paste event.
+ */
+hterm.ScrollPort.prototype.onBodyKeyDown_ = function(e) {
+  if (!this.ctrlVPaste)
+    return;
+
+  var key = String.fromCharCode(e.which);
+  var lowerKey = key.toLowerCase();
+  if ((e.ctrlKey || e.metaKey) && lowerKey == "v")
+    this.pasteTarget_.focus();
+};
+
+/**
  * Handle a paste event on the the ScrollPort's screen element.
  */
 hterm.ScrollPort.prototype.onPaste_ = function(e) {
@@ -4288,10 +4517,26 @@ hterm.ScrollPort.prototype.onPaste_ = function(e) {
 };
 
 /**
+ * Handles a textInput event on the paste target. Stops this from
+ * propagating as we want this to be handled in the onPaste_ method.
+ */
+hterm.ScrollPort.prototype.handlePasteTargetTextInput_ = function(e) {
+  e.stopPropagation();
+};
+
+/**
  * Set the vertical scrollbar mode of the ScrollPort.
  */
 hterm.ScrollPort.prototype.setScrollbarVisible = function(state) {
   this.screen_.style.overflowY = state ? 'scroll' : 'hidden';
+};
+
+/**
+ * Set scroll wheel multiplier. This alters how much the screen scrolls on
+ * mouse wheel events.
+ */
+hterm.ScrollPort.prototype.setScrollWheelMoveMultipler = function(multiplier) {
+  this.scrollWheelMultiplier_ = multiplier;
 };
 // SOURCE FILE: hterm/js/hterm_terminal.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -4300,7 +4545,7 @@ hterm.ScrollPort.prototype.setScrollbarVisible = function(state) {
 
 'use strict';
 
-lib.rtdep('lib.colors', 'lib.PreferenceManager', 'lib.resource',
+lib.rtdep('lib.colors', 'lib.PreferenceManager', 'lib.resource', 'lib.wc',
           'hterm.Keyboard', 'hterm.Options', 'hterm.PreferenceManager',
           'hterm.Screen', 'hterm.ScrollPort', 'hterm.Size',
           'hterm.TextAttributes', 'hterm.VT');
@@ -4380,6 +4625,13 @@ hterm.Terminal = function(opt_profileId) {
   // The current color of the cursor.
   this.cursorColor_ = null;
 
+  // Cursor blink on/off cycle in ms, overwritten by prefs once they're loaded.
+  this.cursorBlinkCycle_ = [100, 100];
+
+  // Pre-bound onCursorBlink_ handler, so we don't have to do this for each
+  // cursor on/off servicing.
+  this.myOnCursorBlink_ = this.onCursorBlink_.bind(this);
+
   // These prefs are cached so we don't have to read from local storage with
   // each output and keystroke.  They are initialized by the preference manager.
   this.backgroundColor_ = null;
@@ -4394,6 +4646,13 @@ hterm.Terminal = function(opt_profileId) {
   // Terminal bell sound.
   this.bellAudio_ = this.document_.createElement('audio');
   this.bellAudio_.setAttribute('preload', 'auto');
+
+  // All terminal bell notifications that have been generated (not necessarily
+  // shown).
+  this.bellNotificationList_ = [];
+
+  // Whether we have permission to display notifications.
+  this.desktopNotificationBell_ = false;
 
   // Cursor position and attributes saved with DECSC.
   this.savedOptions_ = {};
@@ -4419,6 +4678,11 @@ hterm.Terminal = function(opt_profileId) {
 
   this.copyOnSelect = null;
   this.mousePasteButton = null;
+
+  // Whether to use the default window copy behaviour.
+  this.useDefaultWindowCopy = false;
+
+  this.clearSelectionAfterCopy = true;
 
   this.realizeSize_(80, 24);
   this.setDefaultTabStops();
@@ -4496,6 +4760,25 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       }
     },
 
+    'desktop-notification-bell': function(v) {
+      if (v && Notification) {
+        terminal.desktopNotificationBell_ =
+            Notification.permission === 'granted';
+        if (!terminal.desktopNotificationBell_) {
+          // Note: We don't call Notification.requestPermission here because
+          // Chrome requires the call be the result of a user action (such as an
+          // onclick handler), and pref listeners are run asynchronously.
+          //
+          // A way of working around this would be to display a dialog in the
+          // terminal with a "click-to-request-permission" button.
+          console.warn('desktop-notification-bell is true but we do not have ' +
+                       'permission to display notifications.');
+        }
+      } else {
+        terminal.desktopNotificationBell_ = false;
+      }
+    },
+
     'background-color': function(v) {
       terminal.setBackgroundColor(v);
     },
@@ -4518,6 +4801,19 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
 
     'cursor-blink': function(v) {
       terminal.setCursorBlink(!!v);
+    },
+
+    'cursor-blink-cycle': function(v) {
+        if (v instanceof Array &&
+            typeof v[0] == 'number' &&
+            typeof v[1] == 'number') {
+          terminal.cursorBlinkCycle_ = v;
+        } else if (typeof v == 'number') {
+          terminal.cursorBlinkCycle_ = [v, v];
+        } else {
+          // Fast blink indicates an error.
+          terminal.cursorBlinkCycle_ = [100, 100];
+        }
     },
 
     'cursor-color': function(v) {
@@ -4557,12 +4853,29 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       terminal.copyOnSelect = !!v;
     },
 
+    'use-default-window-copy': function(v) {
+      terminal.useDefaultWindowCopy = !!v;
+    },
+
+    'clear-selection-after-copy': function(v) {
+      terminal.clearSelectionAfterCopy = !!v;
+    },
+
     'ctrl-plus-minus-zero-zoom': function(v) {
       terminal.keyboard.ctrlPlusMinusZeroZoom = v;
     },
 
+    'ctrl-c-copy': function(v) {
+      terminal.keyboard.ctrlCCopy = v;
+    },
+
     'ctrl-v-paste': function(v) {
       terminal.keyboard.ctrlVPaste = v;
+      terminal.scrollPort_.setCtrlVPaste(v);
+    },
+
+    'east-asian-ambiguous-as-two-column': function(v) {
+      lib.wc.regardCjkAmbiguous = v;
     },
 
     'enable-8-bit-control': function(v) {
@@ -4662,6 +4975,10 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
       terminal.passMetaNumber = v;
     },
 
+    'pass-meta-v': function(v) {
+      terminal.keyboard.passMetaV = v;
+    },
+
     'receive-encoding': function(v) {
        if (!(/^(utf-8|raw)$/).test(v)) {
          console.warn('Invalid value for "receive-encoding": ' + v);
@@ -4681,6 +4998,10 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
 
     'scrollbar-visible': function(v) {
       terminal.setScrollbarVisible(v);
+    },
+
+    'scroll-wheel-move-multiplier': function(v) {
+      terminal.setScrollWheelMoveMultipler(v);
     },
 
     'send-encoding': function(v) {
@@ -4707,6 +5028,21 @@ hterm.Terminal.prototype.setProfile = function(profileId, opt_callback) {
     if (opt_callback)
       opt_callback();
   }.bind(this));
+};
+
+
+/**
+ * Returns the preferences manager used for configuring this terminal.
+ */
+hterm.Terminal.prototype.getPrefs = function() {
+  return this.prefs_;
+};
+
+/**
+ * Enable or disable bracketed paste mode.
+ */
+hterm.Terminal.prototype.setBracketedPaste = function(state) {
+  this.options_.bracketedPaste = state;
 };
 
 /**
@@ -4828,7 +5164,7 @@ hterm.Terminal.prototype.isPrimaryScreen = function() {
  * terminal.
  */
 hterm.Terminal.prototype.installKeyboard = function() {
-  this.keyboard.installKeyboard(this.scrollPort_.getScreenNode());
+  this.keyboard.installKeyboard(this.scrollPort_.getDocument().body);
 }
 
 /**
@@ -5005,8 +5341,9 @@ hterm.Terminal.prototype.setWidth = function(columnCount) {
     return;
   }
 
-  this.div_.style.width = this.scrollPort_.characterSize.width *
-      columnCount + this.scrollPort_.currentScrollbarWidthPx + 'px';
+  this.div_.style.width = Math.ceil(
+      this.scrollPort_.characterSize.width *
+      columnCount + this.scrollPort_.currentScrollbarWidthPx) + 'px';
   this.realizeSize_(columnCount, this.screenSize.height);
   this.scheduleSyncCursorPosition_();
 };
@@ -5369,6 +5706,8 @@ hterm.Terminal.prototype.decorate = function(div) {
   this.syncFontFamily();
 
   this.setScrollbarVisible(this.prefs_.get('scrollbar-visible'));
+  this.setScrollWheelMoveMultipler(
+      this.prefs_.get('scroll-wheel-move-multiplier'));
 
   this.document_ = this.scrollPort_.getDocument();
 
@@ -5383,6 +5722,12 @@ hterm.Terminal.prototype.decorate = function(div) {
 
   screenNode.addEventListener(
       'focus', this.onFocusChange_.bind(this, true));
+  // Listen for mousedown events on the screenNode as in FF the focus
+  // events don't bubble.
+  screenNode.addEventListener('mousedown', function() {
+    setTimeout(this.onFocusChange_.bind(this, true));
+  }.bind(this));
+
   screenNode.addEventListener(
       'blur', this.onFocusChange_.bind(this, false));
 
@@ -5413,7 +5758,8 @@ hterm.Terminal.prototype.decorate = function(div) {
        'display: block;' +
        'width: ' + this.scrollPort_.characterSize.width + 'px;' +
        'height: ' + this.scrollPort_.characterSize.height + 'px;' +
-       '-webkit-transition: opacity, background-color 100ms linear;');
+       '-webkit-transition: opacity, background-color 100ms linear;' +
+       '-moz-transition: opacity, background-color 100ms linear;');
 
   this.setCursorColor(this.prefs_.get('cursor-color'));
   this.setCursorBlink(!!this.prefs_.get('cursor-blink'));
@@ -6265,10 +6611,47 @@ hterm.Terminal.prototype.cursorDown = function(count) {
 /**
  * Move the cursor left a specified number of columns.
  *
+ * If reverse wraparound mode is enabled and the previous row wrapped into
+ * the current row then we back up through the wraparound as well.
+ *
  * @param {integer} count The number of columns to move the cursor.
  */
 hterm.Terminal.prototype.cursorLeft = function(count) {
-  return this.cursorRight(-(count || 1));
+  count = count || 1;
+
+  if (count < 1)
+    return;
+
+  var currentColumn = this.screen_.cursorPosition.column;
+  if (this.options_.reverseWraparound) {
+    if (this.screen_.cursorPosition.overflow) {
+      // If this cursor is in the right margin, consume one count to get it
+      // back to the last column.  This only applies when we're in reverse
+      // wraparound mode.
+      count--;
+      this.clearCursorOverflow();
+
+      if (!count)
+        return;
+    }
+
+    var newRow = this.screen_.cursorPosition.row;
+    var newColumn = currentColumn - count;
+    if (newColumn < 0) {
+      newRow = newRow - Math.floor(count / this.screenSize.width) - 1;
+      if (newRow < 0) {
+        // xterm also wraps from row 0 to the last row.
+        newRow = this.screenSize.height + newRow % this.screenSize.height;
+      }
+      newColumn = this.screenSize.width + newColumn % this.screenSize.width;
+    }
+
+    this.setCursorPosition(Math.max(newRow, 0), newColumn);
+
+  } else {
+    var newColumn = Math.max(currentColumn - count, 0);
+    this.setCursorColumn(newColumn);
+  }
 };
 
 /**
@@ -6278,6 +6661,10 @@ hterm.Terminal.prototype.cursorLeft = function(count) {
  */
 hterm.Terminal.prototype.cursorRight = function(count) {
   count = count || 1;
+
+  if (count < 1)
+    return;
+
   var column = lib.f.clamp(this.screen_.cursorPosition.column + count,
                            0, this.screenSize.width - 1);
   this.setCursorColumn(column);
@@ -6317,17 +6704,26 @@ hterm.Terminal.prototype.ringBell = function() {
       self.cursorNode_.style.backgroundColor = self.prefs_.get('cursor-color');
     }, 200);
 
+  // bellSquelchTimeout_ affects both audio and notification bells.
+  if (this.bellSquelchTimeout_)
+    return;
+
   if (this.bellAudio_.getAttribute('src')) {
-    if (this.bellSquelchTimeout_)
-      return;
-
     this.bellAudio_.play();
-
     this.bellSequelchTimeout_ = setTimeout(function() {
         delete this.bellSquelchTimeout_;
       }.bind(this), 500);
   } else {
     delete this.bellSquelchTimeout_;
+  }
+
+  if (this.desktopNotificationBell_ && !this.document_.hasFocus()) {
+    var n = new Notification(
+        lib.f.replaceVars(hterm.desktopNotificationTitle,
+                          {'title': window.document.title || 'hterm'}));
+    this.bellNotificationList_.push(n);
+    // TODO: Should we try to raise the window here?
+    n.onclick = function() { self.closeBellNotifications_(); };
   }
 };
 
@@ -6491,8 +6887,7 @@ hterm.Terminal.prototype.setCursorVisible = function(state) {
     if (this.timeouts_.cursorBlink)
       return;
 
-    this.timeouts_.cursorBlink = setInterval(this.onCursorBlink_.bind(this),
-                                             500);
+    this.onCursorBlink_();
   } else {
     if (this.timeouts_.cursorBlink) {
       clearTimeout(this.timeouts_.cursorBlink);
@@ -6516,6 +6911,13 @@ hterm.Terminal.prototype.syncCursorPosition_ = function() {
     this.cursorNode_.style.top = -this.scrollPort_.characterSize.height + 'px';
     return;
   }
+
+  if (this.options_.cursorVisible &&
+      this.cursorNode_.style.display == 'none') {
+    // Re-display the terminal cursor if it was hidden by the mouse cursor.
+    this.cursorNode_.style.display = '';
+  }
+
 
   this.cursorNode_.style.top = this.scrollPort_.visibleRowTopMargin +
       this.scrollPort_.characterSize.height * (cursorRowIndex - topRowIndex) +
@@ -6617,7 +7019,9 @@ hterm.Terminal.prototype.showZoomWarning_ = function(state) {
         'right: 1.2em;' +
         'position: absolute;' +
         '-webkit-text-size-adjust: none;' +
-        '-webkit-user-select: none;');
+        '-webkit-user-select: none;' +
+        '-moz-text-size-adjust: none;' +
+        '-moz-user-select: none;');
   }
 
   this.zoomWarningNode_.textContent = lib.MessageManager.replaceReferences(
@@ -6660,7 +7064,9 @@ hterm.Terminal.prototype.showOverlay = function(msg, opt_timeout) {
         'padding: 0.2em 0.5em 0.2em 0.5em;' +
         'position: absolute;' +
         '-webkit-user-select: none;' +
-        '-webkit-transition: opacity 180ms ease-in;');
+        '-webkit-transition: opacity 180ms ease-in;' +
+        '-moz-user-select: none;' +
+        '-moz-transition: opacity 180ms ease-in;');
 
     this.overlayNode_.addEventListener('mousedown', function(e) {
       e.preventDefault();
@@ -6681,9 +7087,10 @@ hterm.Terminal.prototype.showOverlay = function(msg, opt_timeout) {
   var divSize = hterm.getClientSize(this.div_);
   var overlaySize = hterm.getClientSize(this.overlayNode_);
 
-  this.overlayNode_.style.top = (divSize.height - overlaySize.height) / 2;
+  this.overlayNode_.style.top =
+      (divSize.height - overlaySize.height) / 2 + 'px';
   this.overlayNode_.style.left = (divSize.width - overlaySize.width -
-      this.scrollPort_.currentScrollbarWidthPx) / 2;
+      this.scrollPort_.currentScrollbarWidthPx) / 2 + 'px';
 
   var self = this;
 
@@ -6724,6 +7131,7 @@ hterm.Terminal.prototype.copyStringToClipboard = function(str) {
   copySource.textContent = str;
   copySource.style.cssText = (
       '-webkit-user-select: text;' +
+      '-moz-user-select: text;' +
       'position: absolute;' +
       'top: -99px');
 
@@ -6739,8 +7147,12 @@ hterm.Terminal.prototype.copyStringToClipboard = function(str) {
 
   hterm.copySelectionToClipboard(this.document_);
 
-  selection.collapse(anchorNode, anchorOffset);
-  selection.extend(focusNode, focusOffset);
+  // IE doesn't support selection.extend. This means that the selection
+  // won't return on IE.
+  if (selection.extend) {
+    selection.collapse(anchorNode, anchorOffset);
+    selection.extend(focusNode, focusOffset);
+  }
 
   copySource.parentNode.removeChild(copySource);
 };
@@ -6846,15 +7258,30 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
 
   e.processedByTerminalHandler_ = true;
 
+  // One based row/column stored on the mouse event.
+  e.terminalRow = parseInt((e.clientY - this.scrollPort_.visibleRowTopMargin) /
+                           this.scrollPort_.characterSize.height) + 1;
+  e.terminalColumn = parseInt(e.clientX /
+                              this.scrollPort_.characterSize.width) + 1;
+
   if (e.type == 'mousedown' && e.terminalColumn > this.screenSize.width) {
     // Mousedown in the scrollbar area.
     return;
   }
 
-  e.terminalRow = parseInt((e.clientY - this.scrollPort_.visibleRowTopMargin) /
-                           this.scrollPort_.characterSize.height) + 1;
-  e.terminalColumn = parseInt(e.clientX /
-                              this.scrollPort_.characterSize.width) + 1;
+  if (this.options_.cursorVisible &&
+      this.vt.mouseReport == this.vt.MOUSE_REPORT_DISABLED) {
+    // If the cursor is visible and we're not sending mouse events to the
+    // host app, then we want to hide the terminal cursor when the mouse
+    // cursor is over top.  This keeps the terminal cursor from interfering
+    // with local text selection.
+    if (e.terminalRow - 1 == this.screen_.cursorPosition.row &&
+        e.terminalColumn - 1 == this.screen_.cursorPosition.column) {
+      this.cursorNode_.style.display = 'none';
+    } else if (this.cursorNode_.style.display == 'none') {
+      this.cursorNode_.style.display = '';
+    }
+  }
 
   if (e.type == 'mousedown') {
     if (e.altKey || this.vt.mouseReport == this.vt.MOUSE_REPORT_DISABLED) {
@@ -6865,7 +7292,7 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
     } else {
       // Otherwise we defer ownership of the mouse to the VT.
       this.reportMouseEvents_ = true;
-      this.document_.getSelection().collapse();
+      this.document_.getSelection().collapseToEnd();
       this.setSelectionEnabled(false);
       e.preventDefault();
     }
@@ -6903,7 +7330,7 @@ hterm.Terminal.prototype.onMouse_ = function(e) {
       } else if (e.type == 'mousemove') {
         // Oh.  This means that drag-scroll was disabled AFTER the mouse down,
         // in which case it's too late to engage the scroll-blocker.
-        this.document_.getSelection().collapse();
+        this.document_.getSelection().collapseToEnd();
         e.preventDefault();
       }
     }
@@ -6931,9 +7358,11 @@ hterm.Terminal.prototype.onMouse = function(e) { };
 /**
  * React when focus changes.
  */
-hterm.Terminal.prototype.onFocusChange_ = function(state) {
-  this.cursorNode_.setAttribute('focus', state ? 'true' : 'false');
+hterm.Terminal.prototype.onFocusChange_ = function(focused) {
+  this.cursorNode_.setAttribute('focus', focused);
   this.restyleCursor_();
+  if (focused === true)
+    this.closeBellNotifications_();
 };
 
 /**
@@ -6947,16 +7376,22 @@ hterm.Terminal.prototype.onScroll_ = function() {
  * React when text is pasted into the scrollPort.
  */
 hterm.Terminal.prototype.onPaste_ = function(e) {
-  this.onVTKeystroke(e.text.replace(/\n/mg, '\r'));
+  var data = e.text.replace(/\n/mg, '\r');
+  data = this.keyboard.encode(data);
+  if (this.options_.bracketedPaste)
+    data = '\x1b[200~' + data + '\x1b[201~';
+
+  this.io.sendString(data);
 };
 
 /**
  * React when the user tries to copy from the scrollPort.
  */
 hterm.Terminal.prototype.onCopy_ = function(e) {
-  /* comment this line so that browser copies the selection */
-  // e.preventDefault();
-  setTimeout(this.copySelectionToClipboard.bind(this), 0);
+  if (!this.useDefaultWindowCopy) {
+    e.preventDefault();
+    setTimeout(this.copySelectionToClipboard.bind(this), 0);
+  }
 };
 
 /**
@@ -6999,11 +7434,20 @@ hterm.Terminal.prototype.onResize_ = function() {
  * Service the cursor blink timeout.
  */
 hterm.Terminal.prototype.onCursorBlink_ = function() {
+  if (!this.options_.cursorBlink) {
+    delete this.timeouts_.cursorBlink;
+    return;
+  }
+
   if (this.cursorNode_.getAttribute('focus') == 'false' ||
       this.cursorNode_.style.opacity == '0') {
     this.cursorNode_.style.opacity = '1';
+    this.timeouts_.cursorBlink = setTimeout(this.myOnCursorBlink_,
+                                            this.cursorBlinkCycle_[0]);
   } else {
     this.cursorNode_.style.opacity = '0';
+    this.timeouts_.cursorBlink = setTimeout(this.myOnCursorBlink_,
+                                            this.cursorBlinkCycle_[1]);
   }
 };
 
@@ -7019,6 +7463,28 @@ hterm.Terminal.prototype.onCursorBlink_ = function() {
  */
 hterm.Terminal.prototype.setScrollbarVisible = function(state) {
   this.scrollPort_.setScrollbarVisible(state);
+};
+
+/**
+ * Set the scroll wheel move multiplier.  This will affect how fast the page
+ * scrolls on mousewheel events.
+ *
+ * Defaults to 1.
+ *
+ * @param {number} multiplier.
+ */
+hterm.Terminal.prototype.setScrollWheelMoveMultipler = function(multiplier) {
+  this.scrollPort_.setScrollWheelMoveMultipler(multiplier);
+};
+
+/**
+ * Close all web notifications created by terminal bells.
+ */
+hterm.Terminal.prototype.closeBellNotifications_ = function() {
+  this.bellNotificationList_.forEach(function(n) {
+      n.close();
+    });
+  this.bellNotificationList_.length = 0;
 };
 // SOURCE FILE: hterm/js/hterm_terminal_io.js
 // Copyright (c) 2012 The Chromium OS Authors. All rights reserved.
@@ -7242,11 +7708,15 @@ lib.rtdep('lib.colors');
  */
 hterm.TextAttributes = function(document) {
   this.document_ = document;
-  this.foregroundIndex = null;
-  this.backgroundIndex = null;
+  // These variables contain the source of the color as either:
+  // SRC_DEFAULT  (use context default)
+  // SRC_RGB      (specified in 'rgb( r, g, b)' form)
+  // number       (representing the index from color palette to use)
+  this.foregroundSource = this.SRC_DEFAULT;
+  this.backgroundSource = this.SRC_DEFAULT;
 
-  // These properties cache the value in the color table, but foregroundIndex
-  // and backgroundIndex contain the canonical values.
+  // These properties cache the value in the color table, but foregroundSource
+  // and backgroundSource contain the canonical values.
   this.foreground = this.DEFAULT_COLOR;
   this.background = this.DEFAULT_COLOR;
 
@@ -7254,11 +7724,13 @@ hterm.TextAttributes = function(document) {
   this.defaultBackground = 'rgb(0, 0, 0)';
 
   this.bold = false;
+  this.italic = false;
   this.blink = false;
   this.underline = false;
   this.inverse = false;
   this.invisible = false;
   this.wcNode = false;
+  this.tileData = null;
 
   this.colorPalette = null;
   this.resetColorPalette();
@@ -7283,6 +7755,18 @@ hterm.TextAttributes.prototype.enableBoldAsBright = true;
  * A sentinel constant meaning "whatever the default color is in this context".
  */
 hterm.TextAttributes.prototype.DEFAULT_COLOR = new String('');
+
+/**
+ * A constant string used to specify that source color is context default.
+ */
+hterm.TextAttributes.prototype.SRC_DEFAULT = 'default';
+
+
+/**
+ * A constant string used to specify that the source of a color is a valid
+ * rgb( r, g, b) specifier.
+ */
+hterm.TextAttributes.prototype.SRC_RGB = 'rgb';
 
 /**
  * The document object which should own the DOM nodes created by this instance.
@@ -7313,13 +7797,15 @@ hterm.TextAttributes.prototype.clone = function() {
  * Reset the current set of attributes.
  *
  * This does not affect the palette.  Use resetColorPalette() for that.
+ * It also doesn't affect the tile data, it's not meant to.
  */
 hterm.TextAttributes.prototype.reset = function() {
-  this.foregroundIndex = null;
-  this.backgroundIndex = null;
+  this.foregroundSource = this.SRC_DEFAULT;
+  this.backgroundSource = this.SRC_DEFAULT;
   this.foreground = this.DEFAULT_COLOR;
   this.background = this.DEFAULT_COLOR;
   this.bold = false;
+  this.italic = false;
   this.blink = false;
   this.underline = false;
   this.inverse = false;
@@ -7341,14 +7827,16 @@ hterm.TextAttributes.prototype.resetColorPalette = function() {
  * @return {boolean} True if the current attributes describe unstyled text.
  */
 hterm.TextAttributes.prototype.isDefault = function() {
-  return (this.foregroundIndex == null &&
-          this.backgroundIndex == null &&
+  return (this.foregroundSource == this.SRC_DEFAULT &&
+          this.backgroundSource == this.SRC_DEFAULT &&
           !this.bold &&
+          !this.italic &&
           !this.blink &&
           !this.underline &&
           !this.inverse &&
           !this.invisible &&
-          !this.wcNode);
+          !this.wcNode &&
+          this.tileData == null);
 };
 
 /**
@@ -7359,6 +7847,8 @@ hterm.TextAttributes.prototype.isDefault = function() {
  * an HTML span if the text is styled.  Due to lack of monospace wide character
  * fonts on certain systems (e.g. Chrome OS), we need to put each wide character
  * in a span of CSS class '.wc-node' which has double column width.
+ * Each vt_tiledata tile is also represented by a span with a single
+ * character, with CSS classes '.tile' and '.tile_<glyph number>'.
  *
  * @param {string} opt_textContent Optional text content for the new container.
  * @return {HTMLNode} An HTML span or text nodes styled to match the current
@@ -7374,16 +7864,14 @@ hterm.TextAttributes.prototype.createContainer = function(opt_textContent) {
   if (this.foreground != this.DEFAULT_COLOR)
     style.color = this.foreground;
 
-  if (this.background != this.DEFAULT_COLOR) {
+  if (this.background != this.DEFAULT_COLOR)
     style.backgroundColor = this.background;
-    // This bottom border ensures that the extra row of pixels at the bottom of
-    // the character cell (used to hold underscores in some fonts) has the
-    // correct background color.
-    style.borderBottom = '1px ' + this.background + ' solid';
-  }
 
   if (this.enableBold && this.bold)
     style.fontWeight = 'bold';
+
+  if (this.italic)
+    style.fontStyle = 'italic';
 
   if (this.blink)
     style.fontStyle = 'italic';
@@ -7394,6 +7882,12 @@ hterm.TextAttributes.prototype.createContainer = function(opt_textContent) {
   if (this.wcNode) {
     span.className = 'wc-node';
     span.wcNode = true;
+  }
+
+  if (this.tileData != null) {
+    // This could be a wcNode too, so we add to the className here.
+    span.className += ' tile tile_' + this.tileData;
+    span.tileNode = true;
   }
 
   if (opt_textContent)
@@ -7421,13 +7915,14 @@ hterm.TextAttributes.prototype.matchesContainer = function(obj) {
 
   var style = obj.style;
 
-  // We don't want to put multiple wide characters in a wcNode. See the comment
-  // in createContainer.
+  // We don't want to put multiple characters in a wcNode or a tile.
+  // See the comments in createContainer.
   return (!(this.wcNode || obj.wcNode) &&
+          !(this.tileData != null || obj.tileNode) &&
           this.foreground == style.color &&
           this.background == style.backgroundColor &&
           (this.enableBold && this.bold) == !!style.fontWeight &&
-          this.blink == !!style.fontStyle &&
+          (this.blink || this.italic) == !!style.fontStyle &&
           this.underline == !!style.textDecoration);
 };
 
@@ -7460,31 +7955,39 @@ hterm.TextAttributes.prototype.syncColors = function() {
     return i;
   }
 
-  var foregroundIndex = this.foregroundIndex;
-  var backgroundIndex = this.backgroundIndex;
+  var foregroundSource = this.foregroundSource;
+  var backgroundSource = this.backgroundSource;
   var defaultForeground = this.DEFAULT_COLOR;
   var defaultBackground = this.DEFAULT_COLOR;
 
   if (this.inverse) {
-    foregroundIndex = this.backgroundIndex;
-    backgroundIndex = this.foregroundIndex;
+    foregroundSource = this.backgroundSource;
+    backgroundSource = this.foregroundSource;
     // We can't inherit the container's color anymore.
     defaultForeground = this.defaultBackground;
     defaultBackground = this.defaultForeground;
   }
 
   if (this.enableBoldAsBright && this.bold) {
-    if (foregroundIndex != null)
-      foregroundIndex = getBrightIndex(foregroundIndex);
+    if (foregroundSource != this.SRC_DEFAULT &&
+        foregroundSource != this.SRC_RGB) {
+      foregroundSource = getBrightIndex(foregroundSource);
+    }
   }
 
   if (this.invisible)
-    foregroundIndex = backgroundIndex;
+    foregroundSource = backgroundSource;
 
-  this.foreground = ((foregroundIndex == null) ? defaultForeground :
-                     this.colorPalette[foregroundIndex]);
-  this.background = ((backgroundIndex == null) ? defaultBackground :
-                     this.colorPalette[backgroundIndex]);
+  // Set fore/background colors unless already specified in rgb(r, g, b) form.
+  if (foregroundSource != this.SRC_RGB) {
+    this.foreground = ((foregroundSource == this.SRC_DEFAULT) ?
+                       defaultForeground : this.colorPalette[foregroundSource]);
+  }
+
+  if (backgroundSource != this.SRC_RGB) {
+    this.background = ((backgroundSource == this.SRC_DEFAULT) ?
+                       defaultBackground : this.colorPalette[backgroundSource]);
+  }
 };
 
 /**
@@ -8377,7 +8880,7 @@ hterm.VT.prototype.setANSIMode = function(code, state) {
  *   1053 - [x] Set SCO function-key mode.
  *   1060 - [x] Set legacy keyboard emulation (X11R6).
  *   1061 - [!] Set VT220 keyboard emulation.
- *   2004 - [!] Set bracketed paste mode.
+ *   2004 - Set bracketed paste mode.
  *
  * [!] - Not currently implemented, may be in the future.
  * [x] - Will not implement.
@@ -8474,6 +8977,10 @@ hterm.VT.prototype.setDECMode = function(code, state) {
         this.savedState_.restore();
       }
 
+      break;
+
+    case '2004':  // Bracketed paste mode.
+      this.terminal.setBracketedPaste(state);
       break;
 
     default:
@@ -9218,7 +9725,7 @@ hterm.VT.OSC['52'] = function(parseState) {
   // Args come in as a single 'clipboard;b64-data' string.  The clipboard
   // parameter is used to select which of the X clipboards to address.  Since
   // we're not integrating with X, we treat them all the same.
-  var args = parseState.args[0].match(/^[cps01234567]+;(.*)/);
+  var args = parseState.args[0].match(/^[cps01234567]*;(.*)/);
   if (!args)
     return;
 
@@ -9540,11 +10047,13 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *
  *    0 Normal (default).
  *    1 Bold.
+ *    3 Italic (non-xterm).
  *    4 Underlined.
  *    5 Blink (appears as Bold).
  *    7 Inverse.
  *    8 Invisible, i.e., hidden (VT300).
  *   22 Normal (neither bold nor faint).
+ *   23 Not italic (non-xterm).
  *   24 Not underlined.
  *   25 Steady (not blinking).
  *   27 Positive (not inverse).
@@ -9567,6 +10076,10 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *   46 Set background color to Cyan.
  *   47 Set background color to White.
  *   49 Set background color to default (original)
+ *
+ * Non-xterm (italic) codes have mixed support, but are supported by both
+ * gnome-terminal and rxvt and are recognized as CSI codes on Wikipedia
+ * (http://en.wikipedia.org/wiki/ANSI_escape_code).
  *
  * For 16-color support, the following apply.
  *
@@ -9591,6 +10104,10 @@ hterm.VT.CSI['?l'] = function(parseState) {
  *  38 ; 5 ; P Set foreground color to P.
  *  48 ; 5 ; P Set background color to P.
  *
+ *  For true color (24-bit) support, the following apply.
+ *  38 ; 2 ; R ; G ; B Set foreground color to rgb(R, G, B)
+ *  48 ; 2 ; R ; G ; B Set background color to rgb(R, G, B)
+ *
  * Note that most terminals consider "bold" to be "bold and bright".  In
  * some documents the bold state is even referred to as bright.  We interpret
  * bold as bold-bright here too, but only when the "bold" setting comes before
@@ -9602,6 +10119,16 @@ hterm.VT.CSI['m'] = function(parseState) {
       return null;
 
     return parseState.iarg(i + 2, 0);
+  }
+
+  function getTrueColor(i) {
+    if (parseState.args.length < i + 5 || parseState.args[i + 1] != '2')
+      return null;
+    var r = parseState.iarg(i + 2, 0);
+    var g = parseState.iarg(i + 3, 0);
+    var b = parseState.iarg(i + 4, 0);
+
+    return 'rgb(' + r + ' ,' + g + ' ,' + b + ')';
   }
 
   var attrs = this.terminal.getTextAttributes();
@@ -9619,6 +10146,8 @@ hterm.VT.CSI['m'] = function(parseState) {
         attrs.reset();
       } else if (arg == 1) {
         attrs.bold = true;
+      } else if (arg == 3) {
+        attrs.italic = true;
       } else if (arg == 4) {
         attrs.underline = true;
       } else if (arg == 5) {
@@ -9629,6 +10158,8 @@ hterm.VT.CSI['m'] = function(parseState) {
         attrs.invisible = true;
       } else if (arg == 22) {
         attrs.bold = false;
+      } else if (arg == 23) {
+        attrs.italic = false;
       } else if (arg == 24) {
         attrs.underline = false;
       } else if (arg == 25) {
@@ -9641,48 +10172,69 @@ hterm.VT.CSI['m'] = function(parseState) {
 
     } else if (arg < 50) {
       // Select fore/background color from bottom half of 16 color palette
-      // or from the 256 color palette.
+      // or from the 256 color palette or alternative specify color in fully
+      // qualified rgb(r, g, b) form.
       if (arg < 38) {
-        attrs.foregroundIndex = arg - 30;
+        attrs.foregroundSource = arg - 30;
 
       } else if (arg == 38) {
-        var c = get256(i);
-        if (c == null)
-          break;
+        // First check for true color definition
+        var trueColor = getTrueColor(i);
+        if (trueColor != null) {
+          attrs.foregroundSource = attrs.SRC_RGB;
+          attrs.foreground = trueColor;
 
-        i += 2;
+          i += 5;
+        } else {
+          // Check for 256 color
+          var c = get256(i);
+          if (c == null)
+            break;
 
-        if (c >= attrs.colorPalette.length)
-          continue;
+          i += 2;
 
-        attrs.foregroundIndex = c;
+          if (c >= attrs.colorPalette.length)
+            continue;
+
+          attrs.foregroundSource = c;
+        }
 
       } else if (arg == 39) {
-        attrs.foregroundIndex = null;
+        attrs.foregroundSource = attrs.SRC_DEFAULT;
 
       } else if (arg < 48) {
-        attrs.backgroundIndex = arg - 40;
+        attrs.backgroundSource = arg - 40;
 
       } else if (arg == 48) {
-        var c = get256(i);
-        if (c == null)
-          break;
+        // First check for true color definition
+        var trueColor = getTrueColor(i);
+        if (trueColor != null) {
+          attrs.backgroundSource = attrs.SRC_RGB;
+          attrs.background = trueColor;
 
-        i += 2;
+          i += 5;
+        } else {
+          // Check for 256 color
+          var c = get256(i);
+          if (c == null)
+            break;
 
-        if (c >= attrs.colorPalette.length)
-          continue;
+          i += 2;
 
-        attrs.backgroundIndex = c;
+          if (c >= attrs.colorPalette.length)
+            continue;
+
+          attrs.backgroundSource = c;
+        }
       } else {
-        attrs.backgroundIndex = null;
+        attrs.backgroundSource = attrs.SRC_DEFAULT;
       }
 
     } else if (arg >= 90 && arg <= 97) {
-      attrs.foregroundIndex = arg - 90 + 8;
+      attrs.foregroundSource = arg - 90 + 8;
 
     } else if (arg >= 100 && arg <= 107) {
-      attrs.backgroundIndex = arg - 100 + 8;
+      attrs.backgroundSource = arg - 100 + 8;
     }
   }
 
@@ -9902,7 +10454,7 @@ hterm.VT.CSI[' t'] = hterm.VT.ignore;
  * Restore cursor (ANSI.SYS).
  */
 hterm.VT.CSI['u'] = function() {
-  this.terminal.restoreOptions();
+  this.savedState_.restore();
 };
 
 /**
@@ -9946,6 +10498,27 @@ hterm.VT.CSI['*x'] = hterm.VT.ignore;
  * Will not implement.
  */
 hterm.VT.CSI['$x'] = hterm.VT.ignore;
+
+/**
+ * vt_tiledata (as used by NAOhack and UnNetHack)
+ * (see http://nethackwiki.com/wiki/Vt_tiledata for more info)
+ *
+ * Implemented as far as we care (start a glyph and end a glyph).
+ */
+hterm.VT.CSI['z'] = function(parseState) {
+  if (parseState.args.length < 1)
+    return;
+  var arg = parseState.args[0];
+  if (arg == '0') {
+    // Start a glyph (one parameter, the glyph number).
+    if (parseState.args.length < 2)
+      return;
+    this.terminal.getTextAttributes().tileData = parseState.args[1];
+  } else if (arg == '1') {
+    // End a glyph.
+    this.terminal.getTextAttributes().tileData = null;
+  }
+};
 
 /**
  * Enable Locator Reporting (DECELR).
@@ -10461,22 +11034,22 @@ lib.resource.add('hterm/audio/bell', 'audio/ogg;base64',
 );
 
 lib.resource.add('hterm/concat/date', 'text/plain',
-'Fri, 28 Mar 2014 15:50:05 +0000' +
+'Tue, 13 Jan 2015 22:03:03 +0000' +
 ''
 );
 
 lib.resource.add('hterm/changelog/version', 'text/plain',
-'1.35' +
+'1.51' +
 ''
 );
 
 lib.resource.add('hterm/changelog/date', 'text/plain',
-'2014-03-25' +
+'2014-11-11' +
 ''
 );
 
 lib.resource.add('hterm/git/HEAD', 'text/plain',
-'e1883c2670d32ee4e394b3a6d1e1c18de47f036f' +
+'406157e8e2b6a8ab930dcd2246eb91bbb1342413' +
 ''
 );
 
